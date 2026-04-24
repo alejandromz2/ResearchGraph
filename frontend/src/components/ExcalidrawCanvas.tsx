@@ -1,4 +1,12 @@
-import React, { useState, useMemo, useImperativeHandle, forwardRef } from 'react';
+import {
+  useMemo,
+  useRef,
+  useEffect,
+  useCallback,
+  useImperativeHandle,
+  forwardRef,
+  type MutableRefObject,
+} from 'react';
 import { Excalidraw, MainMenu } from '@excalidraw/excalidraw';
 import { Save } from 'lucide-react';
 import type { Paper, Highlight } from '../types/index';
@@ -9,74 +17,142 @@ import "@excalidraw/excalidraw/index.css";
 
 interface ExcalidrawCanvasProps {
   paper: Paper;
-  onUpdate: (updates: Partial<Paper>) => void;
+  onUpdate: (updates: Partial<Paper>) => void | Promise<void>;
   onHighlightClick?: (id: string) => void;
 }
 
 export interface ExcalidrawCanvasHandle {
   addSnippet: (highlight: Highlight) => void;
+  flushSave: () => Promise<void>;
+}
+
+/** Guardado automático del lienzo cada 2 minutos (sin interrumpir la edición de texto). */
+const AUTOSAVE_INTERVAL_MS = 2 * 60 * 1000;
+
+/** Espera a que Excalidraw exponga la API (callback asíncrono). */
+async function waitForApi(apiRef: MutableRefObject<any>, maxMs = 3000) {
+  const start = Date.now();
+  while (!apiRef.current && Date.now() - start < maxMs) {
+    await new Promise((r) => setTimeout(r, 32));
+  }
+}
+
+/** Tras editar texto en el lienzo, el WYSIWYG confirma al perder foco; forzamos antes de leer la escena. */
+async function commitExcalidrawDomEdits() {
+  (document.activeElement as HTMLElement | null)?.blur?.();
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  });
 }
 
 const ExcalidrawCanvas = forwardRef<ExcalidrawCanvasHandle, ExcalidrawCanvasProps>(({ paper, onUpdate, onHighlightClick }, ref) => {
-  const [excalidrawAPI, setExcalidrawAPI] = useState<any>(null);
+  const apiRef = useRef<any>(null);
+  const onUpdateRef = useRef(onUpdate);
   const { theme } = useTheme();
 
-  useImperativeHandle(ref, () => ({
-    addSnippet: async (highlight: Highlight) => {
-      if (!excalidrawAPI) return;
-      
-      const id = highlight.id;
-      const isImage = !!highlight.content.image;
-      
-      if (isImage && highlight.content.image) {
-        // Handle Image Snippet
-        const fileId = `img-${id}`;
-        const files = {
-          [fileId]: {
-            id: fileId,
-            mimeType: "image/png",
-            dataURL: highlight.content.image,
-            created: Date.now(),
-          }
-        };
+  useEffect(() => {
+    onUpdateRef.current = onUpdate;
+  }, [onUpdate]);
 
-        const elements = [
-          {
-            type: "image",
-            x: 150,
-            y: 150,
-            width: highlight.position.boundingRect.width * 2, // Scale up for visibility
-            height: highlight.position.boundingRect.height * 2,
-            fileId: fileId,
-            strokeColor: "transparent",
-            backgroundColor: "transparent",
-            link: `#highlight-${id}`,
-          }
-        ];
+  const persistCanvasData = useCallback(
+    async (elements: readonly any[], appState: any, files: any) => {
+      const { collaborators: _c, ...persistentAppState } = appState;
+      await Promise.resolve(
+        onUpdateRef.current({
+          canvasData: {
+            elements: elements.filter((el: any) => !el.isDeleted),
+            appState: persistentAppState,
+            files,
+          },
+        })
+      );
+    },
+    []
+  );
 
-        excalidrawAPI.addFiles(Object.values(files));
-        excalidrawAPI.addElements(elements);
-        excalidrawAPI.scrollToContent(elements[0]);
-      } else {
-        // Handle Text Snippet
-        const text = highlight.content.text || 'Reference';
-        const elements = [
-          {
-            type: "text",
-            x: 100,
-            y: 100,
-            text: `(p.${highlight.position.pageNumber}):\n"${text.substring(0, 150)}${text.length > 150 ? '...' : ''}"`,
-            fontSize: 16,
-            fontFamily: 1,
-            strokeColor: theme === 'dark' ? '#3b82f6' : '#2563eb',
-            link: `#highlight-${id}`,
-          }
-        ];
-        excalidrawAPI.addElements(elements);
-        excalidrawAPI.scrollToContent(elements[0]);
-      }
-    }
-  }));
+  const flushSave = useCallback(async () => {
+    await waitForApi(apiRef);
+    const api = apiRef.current;
+    if (!api) return;
+    await commitExcalidrawDomEdits();
+    await persistCanvasData(api.getSceneElements(), api.getAppState(), api.getFiles());
+  }, [persistCanvasData]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void (async () => {
+        const api = apiRef.current;
+        if (!api) return;
+        try {
+          await persistCanvasData(api.getSceneElements(), api.getAppState(), api.getFiles());
+        } catch (e) {
+          console.error('Autosave del lienzo:', e);
+        }
+      })();
+    }, AUTOSAVE_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [paper.id, persistCanvasData]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      flushSave,
+      addSnippet: async (highlight: Highlight) => {
+        const api = apiRef.current;
+        if (!api) return;
+
+        const id = highlight.id;
+        const isImage = !!highlight.content.image;
+
+        if (isImage && highlight.content.image) {
+          const fileId = `img-${id}`;
+          const files = {
+            [fileId]: {
+              id: fileId,
+              mimeType: "image/png",
+              dataURL: highlight.content.image,
+              created: Date.now(),
+            },
+          };
+
+          const elements = [
+            {
+              type: "image",
+              x: 150,
+              y: 150,
+              width: highlight.position.boundingRect.width * 2,
+              height: highlight.position.boundingRect.height * 2,
+              fileId: fileId,
+              strokeColor: "transparent",
+              backgroundColor: "transparent",
+              link: `#highlight-${id}`,
+            },
+          ];
+
+          api.addFiles(Object.values(files));
+          api.addElements(elements);
+          api.scrollToContent(elements[0]);
+        } else {
+          const text = highlight.content.text || 'Reference';
+          const elements = [
+            {
+              type: "text",
+              x: 100,
+              y: 100,
+              text: `(p.${highlight.position.pageNumber}):\n"${text.substring(0, 150)}${text.length > 150 ? '...' : ''}"`,
+              fontSize: 16,
+              fontFamily: 1,
+              strokeColor: theme === 'dark' ? '#3b82f6' : '#2563eb',
+              link: `#highlight-${id}`,
+            },
+          ];
+          api.addElements(elements);
+          api.scrollToContent(elements[0]);
+        }
+      },
+    }),
+    [flushSave, theme]
+  );
 
   const initialData = useMemo(() => {
     const defaultData = {
@@ -107,22 +183,13 @@ const ExcalidrawCanvas = forwardRef<ExcalidrawCanvasHandle, ExcalidrawCanvasProp
   }, [paper.id, theme]);
 
   const handleSave = () => {
-    if (!excalidrawAPI) return;
-    const elements = excalidrawAPI.getSceneElements();
-    const appState = excalidrawAPI.getAppState();
-    const files = excalidrawAPI.getFiles();
-    const { collaborators, ...persistentAppState } = appState;
-
-    onUpdate({ 
-      canvasData: { 
-        elements: elements.filter((el: any) => !el.isDeleted), 
-        appState: persistentAppState,
-        files 
-      } 
-    });
+    void flushSave();
   };
 
-  const onLinkOpen = (element: any, event: CustomEvent<{ nativeEvent: MouseEvent }>) => {
+  const onLinkOpen = (
+    element: any,
+    event: CustomEvent<{ nativeEvent: MouseEvent | PointerEvent }>
+  ) => {
     const link = element.link;
     if (link?.startsWith('#highlight-')) {
       event.preventDefault();
@@ -134,7 +201,9 @@ const ExcalidrawCanvas = forwardRef<ExcalidrawCanvasHandle, ExcalidrawCanvasProp
     <div className="w-full h-full relative overflow-hidden bg-white dark:bg-slate-900">
       <Excalidraw 
         key={`${paper.id}-${theme}`}
-        excalidrawAPI={(api) => setExcalidrawAPI(api)}
+        excalidrawAPI={(api) => {
+          apiRef.current = api;
+        }}
         initialData={initialData}
         onLinkOpen={onLinkOpen}
         theme={theme}
@@ -143,11 +212,11 @@ const ExcalidrawCanvas = forwardRef<ExcalidrawCanvasHandle, ExcalidrawCanvasProp
           canvasActions: {
             changeViewBackgroundColor: true,
             clearCanvas: true,
-            theme: false,
-            saveAsScene: false,
+            toggleTheme: false,
             loadScene: false,
-            export: false
-          }
+            saveToActiveFile: false,
+            export: false,
+          },
         }}
       >
         <MainMenu>

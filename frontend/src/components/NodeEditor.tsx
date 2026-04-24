@@ -1,20 +1,19 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Save, FileText, Layout, MoreVertical, UploadCloud, CheckCircle, ChevronLeft, BarChart2, Database, Zap, MessageSquare, Columns2, BookOpen, Maximize2, FolderOpen, Star, TrendingUp, Tag, X, GitMerge, Book} from 'lucide-react';
+import { Save, FileText, Layout, UploadCloud, CheckCircle, ChevronLeft, BarChart2, Database, Zap, MessageSquare, Columns2, BookOpen, Maximize2, FolderOpen, Star, TrendingUp, Tag, X, GitMerge, Book, Loader2 } from 'lucide-react';
 import { paperApi, edgeApi, getPdfUrl } from '../api';
 import type { Paper, Highlight } from '../types/index';
 import PDFViewer from './PDFViewer';
 import ExcalidrawCanvas from './ExcalidrawCanvas';
 import type { ExcalidrawCanvasHandle } from './ExcalidrawCanvas';
-import { useTheme } from '../hooks/useTheme';
 
 type LayoutMode = 'pdf-form' | 'pdf-canvas' | 'canvas-only';
 
 const NodeEditor = ({ projectId }: { projectId: string }) => {
   const { paperId } = useParams<{ paperId: string }>();
-  const { theme } = useTheme();
   const navigate = useNavigate();
   const canvasRef = useRef<ExcalidrawCanvasHandle>(null);
+  const paperRef = useRef<Paper | null>(null);
 
   const [paper, setPaper] = useState<Paper | null>(null);
   const [loading, setLoading] = useState(true);
@@ -22,6 +21,8 @@ const NodeEditor = ({ projectId }: { projectId: string }) => {
   const [isSaving, setIsSaving] = useState(false);
   const [layoutMode, setLayoutMode] = useState<LayoutMode>('pdf-canvas');
   const [isDragging, setIsDragging] = useState(false);
+  const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
+  const [leaveSaving, setLeaveSaving] = useState(false);
 
   useEffect(() => {
     if (paperId) {
@@ -33,13 +34,103 @@ const NodeEditor = ({ projectId }: { projectId: string }) => {
     }
   }, [paperId, projectId]);
 
-  const handleUpdate = async (updates: Partial<Paper>) => {
+  paperRef.current = paper;
+
+  useEffect(() => {
+    if (!leaveDialogOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !leaveSaving) {
+        e.preventDefault();
+        setLeaveDialogOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [leaveDialogOpen, leaveSaving]);
+
+  const handleUpdate = useCallback(async (updates: Partial<Paper>) => {
     if (!paper) return;
+    const id = paper.id;
     setIsSaving(true);
-    await paperApi.update(paper.id, updates);
-    setPaper({ ...paper, ...updates } as Paper);
-    setTimeout(() => setIsSaving(false), 500);
-  };
+    try {
+      await paperApi.update(id, updates);
+      setPaper((prev) => (prev && prev.id === id ? { ...prev, ...updates } as Paper : prev));
+    } finally {
+      setTimeout(() => setIsSaving(false), 500);
+    }
+  }, [paper]);
+
+  const commitDomEdits = useCallback(async () => {
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    });
+  }, []);
+
+  const goToProjectTable = useCallback(() => {
+    setLeaveDialogOpen(false);
+    navigate(`/project/${projectId}`);
+  }, [navigate, projectId]);
+
+  const openLeaveDialog = useCallback(() => setLeaveDialogOpen(true), []);
+
+  const closeLeaveDialog = useCallback(() => {
+    if (leaveSaving) return;
+    setLeaveDialogOpen(false);
+  }, [leaveSaving]);
+
+  const handleLeaveSaveAndExit = useCallback(async () => {
+    setLeaveSaving(true);
+    try {
+      await commitDomEdits();
+      await new Promise((r) => setTimeout(r, 0));
+      const p = paperRef.current;
+      if (p) {
+        await paperApi.update(p.id, {
+          title: p.title,
+          metrics: p.metrics,
+          dataset: p.dataset,
+          core: p.core,
+          observations: p.observations,
+          group: p.group,
+          relevance: p.relevance,
+          importance: p.importance,
+          labels: p.labels,
+          paperTags: p.paperTags,
+          pdfHighlights: p.pdfHighlights,
+        });
+      }
+      await canvasRef.current?.flushSave?.();
+    } catch (e) {
+      console.error(e);
+      alert('No se pudieron guardar los cambios. Comprueba la conexión con el servidor e inténtalo de nuevo.');
+      return;
+    } finally {
+      setLeaveSaving(false);
+    }
+    goToProjectTable();
+  }, [commitDomEdits, goToProjectTable]);
+
+  const handleLeaveDiscard = useCallback(() => {
+    goToProjectTable();
+  }, [goToProjectTable]);
+
+  const setLayoutModeSafe = useCallback(
+    async (id: LayoutMode) => {
+      const hadCanvas = layoutMode === 'pdf-canvas' || layoutMode === 'canvas-only';
+      const willHaveCanvas = id === 'pdf-canvas' || id === 'canvas-only';
+      if (hadCanvas && !willHaveCanvas) {
+        try {
+          await commitDomEdits();
+          await canvasRef.current?.flushSave?.();
+        } catch (e) {
+          console.error(e);
+        }
+      }
+      setLayoutMode(id);
+    },
+    [commitDomEdits, layoutMode]
+  );
 
   const handleCluster = async () => {
     if (!paper || (!paper.labels.length && !paper.paperTags.length)) {
@@ -151,8 +242,9 @@ const NodeEditor = ({ projectId }: { projectId: string }) => {
       <header className="h-16 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-6 shrink-0 bg-white dark:bg-slate-900 z-10 shadow-sm">
         <div className="flex items-center gap-4 flex-1">
           <button
+            type="button"
             className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg text-slate-500 dark:text-slate-400 transition-colors shadow-sm border border-transparent dark:border-slate-800"
-            onClick={() => navigate(`/project/${projectId}`)}
+            onClick={() => openLeaveDialog()}
           >
             <ChevronLeft size={24} />
           </button>
@@ -184,7 +276,7 @@ const NodeEditor = ({ projectId }: { projectId: string }) => {
           ].map(({ id, label, icon: Icon }) => (
             <button
               key={id}
-              onClick={() => setLayoutMode(id as LayoutMode)}
+              onClick={() => void setLayoutModeSafe(id as LayoutMode)}
               className={`p-2 rounded-lg flex items-center gap-2 transition-all ${layoutMode === id ? 'bg-white dark:bg-slate-600 text-blue-600 dark:text-white shadow-sm' : 'text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'}`}
               title={label}
             >
@@ -202,7 +294,11 @@ const NodeEditor = ({ projectId }: { projectId: string }) => {
               <input type="file" hidden accept="application/pdf" onChange={handleFileUpload} />
             </label>
           )}
-          <button className="btn-primary px-6 h-10 shadow-lg shadow-blue-200 dark:shadow-blue-900/10" onClick={() => navigate(`/project/${projectId}`)}>
+          <button
+            type="button"
+            className="btn-primary px-6 h-10 shadow-lg shadow-blue-200 dark:shadow-blue-900/10"
+            onClick={() => openLeaveDialog()}
+          >
             <Save size={18} className="mr-2" /> Finish
           </button>
         </div>
@@ -434,6 +530,76 @@ const NodeEditor = ({ projectId }: { projectId: string }) => {
           )}
         </main>
       </div>
+
+      {leaveDialogOpen && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-sm"
+          role="presentation"
+          onClick={() => closeLeaveDialog()}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="leave-dialog-title"
+            className="w-full max-w-md rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="leave-dialog-title" className="text-lg font-black text-slate-900 dark:text-white tracking-tight">
+                  ¿Guardar las notas de este paper?
+                </h2>
+                <p className="mt-2 text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
+                  Si escribiste en el lienzo (Excalidraw) o en los campos del formulario, puedes guardarlas en el servidor antes de volver a la tabla del proyecto.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => closeLeaveDialog()}
+                disabled={leaveSaving}
+                className="shrink-0 p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"
+                aria-label="Cerrar"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={leaveSaving}
+                onClick={() => closeLeaveDialog()}
+                className="btn-secondary h-11 justify-center"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={leaveSaving}
+                onClick={() => handleLeaveDiscard()}
+                className="h-11 px-4 rounded-xl font-bold text-sm border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 bg-slate-50 dark:bg-slate-800/80 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50"
+              >
+                Salir sin guardar
+              </button>
+              <button
+                type="button"
+                disabled={leaveSaving}
+                onClick={() => void handleLeaveSaveAndExit()}
+                className="btn-primary h-11 justify-center min-w-[10rem]"
+              >
+                {leaveSaving ? (
+                  <>
+                    <Loader2 size={18} className="mr-2 animate-spin" /> Guardando…
+                  </>
+                ) : (
+                  <>
+                    <Save size={18} className="mr-2" /> Guardar y salir
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
